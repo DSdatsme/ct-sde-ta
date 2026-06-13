@@ -1,0 +1,93 @@
+name: PR
+
+# only for PRs that are based on the main branch, and only when app/build inputs change
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Dockerfile'
+      - '.github/workflows/pr.yml'
+
+concurrency:
+  group: pr-${{ github.ref }}
+  cancel-in-progress: true     # a new push supersedes the in-flight run
+
+permissions:
+  contents: read
+  id-token: write # OIDC: assume the AWS role to push to ECR
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: event-ingestion
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.3
+      - uses: actions/setup-go@v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Lint
+        uses: golangci/golangci-lint-action@v9.2.1
+      - name: Unit tests
+        run: go test -race -coverprofile=coverage.out ./...
+
+  code-scans:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.3
+      # Static analysis on source: dependency vulns, hardcoded secrets, IaC misconfig.
+      - name: Source scan (Trivy fs)
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,secret,misconfig
+          severity: HIGH,CRITICAL
+          exit-code: '1'
+          # Skip vulns with no upstream fix yet — not actionable, would block every PR.
+          ignore-unfixed: true
+
+  build-scan-push:
+    needs: [lint-test, code-scans]
+    runs-on: ubuntu-latest
+    steps:
+      # Check out the PR head commit (not the merge preview) so the image we build, tag, and later promote to staging is exactly that commit.
+      - uses: actions/checkout@v6.0.3
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6.2.0
+        with:
+          role-to-assume: ${{ vars.CI_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2.1.5
+
+      - name: Build image (commit-SHA tag)
+        env:
+          IMAGE: ${{ steps.ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.event.pull_request.head.sha }}
+        run: |
+          docker build -t "$IMAGE" .
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+
+      # Scan BEFORE push so a vulnerable image never reaches the registry.
+      - name: Image scan (Trivy)
+        uses: aquasecurity/trivy-action@0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}
+          format: table
+          exit-code: '1'              # fail the PR on findings
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Push image
+        run: docker push "$IMAGE"

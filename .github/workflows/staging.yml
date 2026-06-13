@@ -1,0 +1,66 @@
+name: Promote to Staging
+
+# After a PR merges to main, bump the staging image tag in the GitOps repo. Argo CD's staging app syncs it 
+# The human gate lives on the production bump, which is a reviewed PR in the GitOps repo (see SOLUTION.md Section 3a).
+on:
+  # Fire when a PR is merged into main. The merged PR's head SHA is the image tag the PR stage already built, scanned, and pushed.
+  # So we promote the exact tested artifact, no rebuild.
+  pull_request:
+    types: [closed]
+    branches: [main]
+
+# Serialize promotions so two quick merges don't race on the git push to the GitOps repo (the loser would reject non-fast-forward). Don't cancel — every merge should land.
+concurrency:
+  group: staging-promote
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  GITOPS_REPO: myrepo/gitops
+  TAG_FILE: envs/staging/event-ingestion/values.yaml
+
+jobs:
+  promote-staging:
+    if: github.event.pull_request.merged == true   # closed-without-merge → skip
+    runs-on: ubuntu-latest
+    steps:
+      # Get short lived GH token.
+      - name: Create GitOps token
+        id: token
+        uses: actions/create-github-app-token@v3.2.0
+        with:
+          app-id: ${{ vars.GITOPS_APP_ID }}
+          private-key: ${{ secrets.GITOPS_APP_KEY }}
+          # `repositories` takes the bare repo name (not owner/repo); owner defaults to this org.
+          owner: ${{ github.repository_owner }}
+          repositories: gitops
+
+      - name: Checkout GitOps repo
+        uses: actions/checkout@v6.0.3
+        with:
+          repository: ${{ env.GITOPS_REPO }}
+          token: ${{ steps.token.outputs.token }}
+
+      # Promote the PR head image — the exact tag built, scanned, and pushed in the PR stage.
+      # Commit straight to the GitOps default branch; staging is ungated on purpose.
+      - name: Bump staging image tag
+        env:
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          yq -i ".image.tag = \"$SHA\"" "$TAG_FILE"
+          git config user.name  "ci-bot"
+          git config user.email "ci-bot@myexample.com"
+          git commit -am "staging: event-ingestion $SHA"
+          git push
+
+  smoke-test:
+    needs: promote-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6.0.3
+      # NOT IMPLEMENTED, just a demo
+      # Waits for Argo to sync new SHA, then runs health + a sample ingest that must land on Kafka.
+      - name: Smoke tests
+        run: ./ci/smoke-test.sh https://event-ingestion.staging.internal ${{ github.event.pull_request.head.sha }}

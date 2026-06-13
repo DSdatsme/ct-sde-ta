@@ -12,6 +12,14 @@ EKS module is implemented in [infra/modules/eks-cluster/](./infra/modules/eks-cl
 
 VPC module is implemented in [infra/modules/vpc/](./infra/modules/vpc/) — see its [README](./infra/modules/vpc/README.md) for inputs, defaults, and usage.
 
+#### Transit Gateway Module (inter-region connectivity)
+
+TGW module is implemented in [infra/modules/transit-gateway/](./infra/modules/transit-gateway/) — see its [README](./infra/modules/transit-gateway/README.md).
+
+**TGW over peering.** Peering is point-to-point and non-transitive whereas a Transit Gateway is a hub: each VPC attaches once, routing is central, and regions join via a single cross-region TGW attachment link. It scales as we add regions/accounts and gives one place to later add inspection or RAM-shared attachments. The module is regional (creates the TGW + VPC attachments).
+
+**Reconciling with 1c.** This does not contradict the EU residency design. The TGW connects the VPCs that are explicitly specified. EU (`eu-west-1`) is deliberately left unattached, so no peering link at all, with the SCP/RCP from 1c as an additional restriction control. So we build inter-region connectivity where it's allowed.
+
 
 ### 1b State & Drift Management
 
@@ -75,7 +83,7 @@ EU gets its own AWS account and its own EKS cluster in `eu-west-1`. No cross-reg
 **One control plane for deployments**
 
 "Single control plane" here is deployment control. We run Argo CD as the deployment tool pointed at every regional cluster. A change merges once in Git, Argo syncs it to the EU cluster and the US cluster from the same definitions. Engineers ship from one place, the clusters stay regionally isolated. Argo pushes manifests, it doesn't move customer data.
-Same with infra creation. All the infra gets created thorugh the same Github Workflows.
+Same with infra creation. All the infra gets created through the same Github Workflows.
 
 **IAM boundary**
 
@@ -176,10 +184,12 @@ The goal is simple: a page should mean "a human needs to act now." Everything el
 We are assuming the microservice to be deployed on EKS is `event-ingestion`. 
 Desired state is one directory per environment (`envs/staging/`, `envs/prod/`), so promotion is just a tag bump in the app's env folder.
 
-- **PR stage** → [.github/workflows/pr.yml](../.github/workflows/pr.yml): lint → unit tests → build image → Trivy → push to ECR, tagged with the commit SHA. The image is scanned *before* push, so a HIGH/CRITICAL finding fails the PR and a vulnerable image never reaches the registry. AWS auth uses GitHub OIDC, so no static IAM keys.
+- **PR stage** → [.github/workflows/pr.yml](../.github/workflows/pr.yml): lint → unit tests → Code Scaning (Trivy fs) → build image → Trivy image scan → push to ECR, tagged with the PR head commit SHA. The image is scanned before push, so a HIGH/CRITICAL finding fails the PR and a vulnerable image never reaches the registry. AWS auth uses GitHub OIDC, so no static IAM keys.
 If you want a real live example: `https://github.com/DSdatsme/dsdatsme-sample-nodejs-app/blob/main/.github/workflows/build.yml`
 
-- **Staging stage** → [.github/workflows/staging.yml](../.github/workflows/staging.yml): on merge to main, bump `envs/staging/.../values.yaml` image tag to the merged SHA (commit straight to the GitOps repo — staging is ungated for fast feedback), Argo CD's staging app syncs, then smoke tests run against staging.
+- **Staging stage** → [.github/workflows/staging.yml](../.github/workflows/staging.yml): runs on PR merge, and bumps `envs/staging/.../values.yaml` to the PR head SHA — i.e. the exact image the PR already built, scanned, and pushed. This is deliberate **build-once**: we promote the tested artifact rather than rebuilding on main. Branch protection requires "branches up to date before merge", so the head commit was tested against current main.
+Argo CD's staging app then syncs, staging is ungated for fast feedback, and smoke tests run against it.
+
 - **Production gate:** promotion to prod is a PR that bumps `envs/prod/` to the staging-validated SHA. Branch protection on the GitOps repo (required review + status checks) *is* the manual approval gate so no GitHub Environment job is needed, because Argo does the deploy, not Actions. Merge → Argo prod app syncs → canary below.
 
 
@@ -242,3 +252,75 @@ DevOps team can help them get some golden templates which are full of guardrails
 - Cost: Since these templates are bounded, the costs will be in control. Their resources would be well labeled.
 - Security: These environments would be created in dev account, so it would be isolated from production or any other account.
 - Cleanup: These envs would have a TTL and we will run a terraform destroy based on it. If they need it for longer, they can extend it or else it will be cleaned up.
+
+## Section 4: Cost Engineering
+
+### 4a. 90-Day Cost Reduction Plan
+
+So the goal is to save approx. $105–126K/mo but since no billing access given it's hard to assume the cost breakdown. So we will start with quick wins and will move towards complex and architectural changes.
+
+
+
+**Quick wins (week 1–2)** — ordered by impact; all low-effort, low-risk, no SLA exposure.
+
+| Initiative | Est. savings | Effort | Risk |
+|---|---|---|---|
+| turn off non-prod envs outside business hours | ~$15K | Low | Low |
+| Setup VPC endpoints (S3, ECR, etc.) to cut NAT data-processing + transfer | ~$10K | Low | Low |
+| Do resource cleanups - Delete idle/un-attached EBS, old snapshots, unused EIPs, idle ALBs, EC2s etc | ~$10K | Low | Low |
+| Setup S3 lifecycle + Intelligent-Tiering on old/cold objects | ~$8K | Low | Low |
+
+Setup kubecost so data is available in the following week.
+
+**Medium-term (month 1–2)** — right-sizing + calculate commitments.
+
+| Initiative | Est. savings | Effort | Risk |
+|---|---|---|---|
+| Check utilization and rightsize resources (EKS, RDS, ElastiCache etc) | ~$50K | Med | Low |
+| Savings Plans (EC2 Instance + Compute) on the steady compute baseline (1-yr) | ~$40K | Low | Low |
+| Reserved Instances for RDS + ElastiCache baseline (1-yr) | ~$15K | Low | Low |
+
+
+*Savings Plans vs RIs — when each:* 
+We will first check the RI and savings plans charts and analyze the trends after the right sizing. for two weeks. based on it we will decide to go with RI or Savings Plans. 
+
+For EKS-EC2: the steady ~70% of capacity goes on 1-year no-upfront **EC2 Instance Savings Plans** (instance-family locked, so the deepest discount), and the remaining ~30% + bursty usage on **Compute Savings Plans** (flexible across family/region). We use Savings Plans for EC2, not RIs — Savings Plans replaced them for compute.
+
+For RDS and ElastiCache, the prod + staging baseline goes on RIs (Savings Plans don't cover these) — stable and predictable, so 1-year, no upfront.
+
+For other services that just do data processing etc would live on spot instance for most. So only 10-30% of EC2 consumption would be over RI+Savings Plans commitment. Which would be ideal.
+
+**Architectural (month 2–3)** — structural changes.
+
+| Initiative | Est. savings | Effort | Risk |
+|---|---|---|---|
+| Move to ARM based EKS nodes + RDS/ElastiCache | ~$25K | Med–High | Low–Med |
+| Cut inter-region transfer: regional read replicas/caches, async + compressed cross-region | ~$20K | High | Med |
+| Add spot instance node pools for specific services | ~$15K | Med | Med |
+| Adopt Karpenter for active node consolidation (supersedes Cluster Autoscaler) | ~$30K | Med | High |
+
+Karpenter bin-packs workloads and terminates underutilized nodes, this is a bigger lever than autoscaler's scale-down (which only removes empty nodes). The risk is higher because consolidation evicts and reschedules running pods, so it needs PDBs and `do-not-disrupt` annotations before rollout.
+
+### 4b. FinOps Process Design
+
+Cutting the bill once is easy; keeping it cut needs teams to see and *own* their spend trends.
+
+**Making it mandatory to tag each and every cloud resource**
+
+A small, required set of keys on everything: `created_by`, `team`, `service`, `environment`, `project`, `purpose`, so they're never missing:
+
+- **In code:** every Terraform module sets these via `default_tags`, so anything provisioned the right way is tagged by construction.
+- **Preventive guardrail:** an SCP/IAM policy with an `aws:RequestTag`/`aws:TagKeys` condition denies resource creation when the required tags are missing, so untagged resources can't be created in the first place, even outside Terraform.
+- **At the org:** AWS Tag Policies flag non-compliant resources, and we backfill the existing click-ops resources once, up front.
+- **Automated reports (backstop):** a script runs daily, finds resources that don't comply with the tagging convention, and emails the list for review.
+
+**Showback first, chargeback later**
+
+Start with **showback** i.e. every team gets a dashboard of their spend and a weekly report. Visibility alone changes behaviour, and it builds trust in the numbers without finance friction. Once tags are trustworthy and teams trust the breakdown, move to **chargeback**, where the spend actually lands on the team's budget.
+
+For the shared resources like EKS, basic AWS level resource tagging is not enough. Kubecost will track costs by namespace/label/pod, and that allocation feeds the same per-team report. 
+
+**Alerting**
+
+- **AWS Budgets** per team/cost-center, alerting at 80%, 100%, and *forecasted* to exceed routed to the owning team's Slack. The team that can act is the team that gets paged.
+- **Anomaly Detection** alerts are also needed so that teams can check if there are sudden spikes in costs for any resource so they can act promptly.
