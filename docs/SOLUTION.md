@@ -10,7 +10,8 @@ EKS module is implemented in [infra/modules/eks-cluster/](./infra/modules/eks-cl
 
 #### VPC Module
 
-VPC module is implemented in [infra/modules/vpc/](./infra/modules/vpc/) — see its [README](./infra/modules/vpc/README.md) for inputs, defaults, and usage.
+VPC module is implemented in [infra/modules/vpc/](./infra/modules/vpc/) — see its [README](./infra/modules/vpc/README.md) for inputs, defaults, and usage. 
+Example usage is added in the folder: [infra/live/](./infra/live/) (`us-east-1` + `ap-south-1`).
 
 #### Transit Gateway Module (inter-region connectivity)
 

@@ -1,0 +1,22 @@
+# Terraform working dirs & state (never commit)
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+crash.log
+crash.*.log
+override.tf
+override.tf.json
+*_override.tf
+*_override.tf.json
+.terraformrc
+terraform.rc
+
+# Provider lock files ARE committed (pin reproducibility) — keep them
+!**/.terraform.lock.hcl
+
+# Local vars / secrets (commit only *.example)
+*.tfvars
+!*.tfvars.example
+.env
+.env.*
