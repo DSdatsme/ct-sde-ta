@@ -97,6 +97,7 @@ Policy gates in the pipeline (OPA/Conftest) check Terraform plans and Kubernetes
 The current infra uses CloudWatch and a self-hosted Prometheus/Grafana for apps, no common alerting. 
 I'd standardize on the Grafana+Prometheus+Loki+Tempo stack with OpenTelemetry as the collection layer, and run the managed flavors where the ops cost isn't worth it. I'm deliberately not reaching for Datadog/New Relic because at 30B events/day their per-host/per-event pricing fights the Section 4 mandate to cut 25–30% off the bill, and we already run half of this.
 Also I assume, since we already run Prometheus, team already has some experience with this stack, and we already have a Grafana running, so we can reuse the same UI and dashboard concepts.
+We will also setup AWS plugin on Grafana to get some AWS specific visualizations if needed.
 
 **The four pillars (one tool each)**
 
@@ -167,3 +168,77 @@ The goal is simple: a page should mean "a human needs to act now." Everything el
 - **% of alerts tied to an SLO + runbook** — coverage of the rule above.
 - **MTTA / MTTR** — are pages even being acted on, and how fast.
 - **Top-N noisiest rules** — Get the top N noisy rules and make them actionable or delete them. If needed automate the action to reduce the noise and page fatigue.
+
+## Section 3: Developer Platform, CI/CD & Engineering Velocity
+
+### 3a. CI/CD Pipeline
+
+We are assuming the microservice to be deployed on EKS is `event-ingestion`. 
+Desired state is one directory per environment (`envs/staging/`, `envs/prod/`), so promotion is just a tag bump in the app's env folder.
+
+- **PR stage** → [.github/workflows/pr.yml](../.github/workflows/pr.yml): lint → unit tests → build image → Trivy → push to ECR, tagged with the commit SHA. The image is scanned *before* push, so a HIGH/CRITICAL finding fails the PR and a vulnerable image never reaches the registry. AWS auth uses GitHub OIDC, so no static IAM keys.
+If you want a real live example: `https://github.com/DSdatsme/dsdatsme-sample-nodejs-app/blob/main/.github/workflows/build.yml`
+
+- **Staging stage** → [.github/workflows/staging.yml](../.github/workflows/staging.yml): on merge to main, bump `envs/staging/.../values.yaml` image tag to the merged SHA (commit straight to the GitOps repo — staging is ungated for fast feedback), Argo CD's staging app syncs, then smoke tests run against staging.
+- **Production gate:** promotion to prod is a PR that bumps `envs/prod/` to the staging-validated SHA. Branch protection on the GitOps repo (required review + status checks) *is* the manual approval gate so no GitHub Environment job is needed, because Argo does the deploy, not Actions. Merge → Argo prod app syncs → canary below.
+
+
+**Production — canary via Argo Rollouts**
+
+Merging the prod bump, Argo CD syncs an Argo Rollout. The canary steps 5 → 10 → 50 → 100% with a pause and an automated analysis at each step:
+
+```yaml
+strategy:
+  canary:
+    maxSurge: 1
+    maxUnavailable: 0
+    steps:
+      - setWeight: 5
+      - pause:
+          duration: 5m
+      - setWeight: 10
+      - pause:
+          duration: 5m
+      - analysis:
+        templates:
+        - templateName: success-rate-latency
+      - setWeight: 50
+      - pause:
+        duration: 10m
+      - analysis:
+        templates:
+        - templateName: success-rate-latency
+      - setWeight: 100
+```
+
+The `AnalysisTemplate` queries Prometheus for the service's SLIs like defined in Section 2a.
+
+Automated rollback is the default: if the metric breaches its threshold during any step, the analysis fails, the Rollout aborts and shifts 100% of traffic back to the stable version so no human needed. We page only after an auto-abort, not to ask permission to roll back.
+
+**Secret management — none in YAML**
+
+Secrets are injected at runtime, never committed. The External Secrets Operator runs in-cluster and syncs from AWS Secrets Manager into native K8s Secrets; the manifests only reference a secret name, not its value. ESO's service account reads Secrets Manager via IRSA, scoped to this service's secret path.
+
+```yaml
+apiVersion: external-secrets.io/v1
+kind: ExternalSecret
+metadata: { name: event-ingestion, namespace: ingest }
+spec:
+  secretStoreRef: { name: aws-secrets-manager, kind: ClusterSecretStore }
+  target: { name: event-ingestion }      # the K8s Secret ESO creates
+  data:
+    - secretKey: kafka_sasl_password
+      remoteRef: { key: prod/ingest/event-ingestion, property: kafka_sasl_password }
+```
+
+So a leaked repo or pipeline log exposes no secrets.
+
+### 3b. Self-Serve Environments using IDP
+
+This IDP portal will allow them to configure the environment parameters and the values are injected into the Terraform templates.
+DevOps team can help them get some golden templates which are full of guardrails and focused.
+
+- Speed: they just have to fill or update the values on portal. Behind the scene it will template the terraform and will create a PR for the same. after reviewing the plan by LLM, it will be merged and auto deployed on staging or dev environment
+- Cost: Since these templates are bounded, the costs will be in control. Their resources would be well labeled.
+- Security: These environments would be created in dev account, so it would be isolated from production or any other account.
+- Cleanup: These envs would have a TTL and we will run a terraform destroy based on it. If they need it for longer, they can extend it or else it will be cleaned up.
